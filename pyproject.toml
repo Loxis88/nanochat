@@ -5,10 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "datasets>=4.8.5",
     "flash-attn",
+    "liger-kernel>=0.8.0",
     "muon>=0.1.7",
     "ninja>=1.13.0",
     "packaging>=26.2",
+    "torch>=2.11.0",
+    "torchao>=0.17.0",
+    "tqdm>=4.67.3",
     "transformers>=5.7.0",
     "wheel>=0.47.0",
 ]

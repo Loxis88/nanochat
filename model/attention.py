@@ -72,6 +72,11 @@ class LowRankAttention(nn.Module):
 
         q, k = apply_rotary_emb(q, k, self.freqs_cis[:T])  # [B,T,H,D]
 
+        if q.dtype not in (torch.float16, torch.bfloat16):
+        flash_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        q = q.to(flash_dtype)
+        k = k.to(flash_dtype)
+        v = v.to(flash_dtype)
 
         ws = (window_size - 1, 0) if is_local else (-1, -1)
         attn_out = flash_attn_func(q, k, v, causal=True, window_size=ws)
