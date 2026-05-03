@@ -152,9 +152,13 @@ class AsyncFineWebBatcher:
         self._ensure_dataset_iter_locked()
 
         while self._available_tokens_locked() < min_tokens and not self.stop_event.is_set():
-            texts = []
+            
+            # Вводим счетчик вместо списка texts
+            processed_in_batch = 0
 
-            while len(texts) < self.doc_tokenize_batch and not self.stop_event.is_set():
+            while processed_in_batch < self.doc_tokenize_batch and not self.stop_event.is_set():
+                processed_in_batch += 1  # Увеличиваем счетчик на каждом шаге!
+
                 try:
                     sample = next(self.dataset_iter)
                 except StopIteration:
@@ -171,7 +175,7 @@ class AsyncFineWebBatcher:
                 if not question or not response:
                     continue
 
-                # Формируем промпт (то, что модель не должна учиться предсказывать)
+                # Формируем промпт
                 prompt_text = ""
                 if sys_prompt:
                     prompt_text += f"Системное сообщение: {sys_prompt}\n\n"
@@ -183,9 +187,11 @@ class AsyncFineWebBatcher:
                 # Токенизируем
                 encoded_full = self.tokenizer(full_text, add_special_tokens=False, truncation=True, max_length=self.max_doc_tokens)
                 full_ids = encoded_full["input_ids"]
+                
+                # ПРОПУСКАЕМ слишком длинные примеры, чтобы не рвать диалоги пополам
                 if len(full_ids) > self.block_size:
                     continue
-                
+
                 prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
                 prompt_len = len(prompt_ids)
 
@@ -197,20 +203,6 @@ class AsyncFineWebBatcher:
                     label_ids[i] = -100
 
                 self._append_or_skip_tokens_locked(full_ids, label_ids)
-
-            if not texts:
-                continue
-
-            # Токенизируем пачку собранных диалогов
-            encoded = self.tokenizer(
-                texts,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=self.max_doc_tokens,
-            )
-
-            for ids in encoded["input_ids"]:
-                self._append_or_skip_tokens_locked(ids)
 
     def _make_one_batch_locked(self):
         tokens_per_batch = self.micro_batch_size * (self.block_size + 1)
