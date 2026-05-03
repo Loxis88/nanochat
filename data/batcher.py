@@ -183,6 +183,8 @@ class AsyncFineWebBatcher:
                 # Токенизируем
                 encoded_full = self.tokenizer(full_text, add_special_tokens=False, truncation=True, max_length=self.max_doc_tokens)
                 full_ids = encoded_full["input_ids"]
+                if len(full_ids) > self.block_size:
+                    continue
                 
                 prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
                 prompt_len = len(prompt_ids)
