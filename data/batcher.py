@@ -51,6 +51,7 @@ class AsyncFineWebBatcher:
 
         # Token stream state
         self.token_buffer = []
+        self.label_buffer = [] # <--- Добавили буфер для таргетов
         self.cursor = 0
 
         # Approximate resume fallback
@@ -126,14 +127,12 @@ class AsyncFineWebBatcher:
     def _compact_if_needed_locked(self):
         if self.cursor > 1_000_000 or self.cursor > len(self.token_buffer) // 2:
             self.token_buffer = self.token_buffer[self.cursor:]
+            self.label_buffer = self.label_buffer[self.cursor:] # <--- Не забываем чистить
             self.cursor = 0
 
-    def _append_or_skip_tokens_locked(self, ids):
+    def _append_or_skip_tokens_locked(self, ids, labels):
         if len(ids) == 0:
             return
-
-        ids = list(ids)
-        ids.append(self.eos_id)
 
         if self.skip_tokens > 0 and self.skipped_tokens < self.skip_tokens:
             need = self.skip_tokens - self.skipped_tokens
@@ -143,9 +142,11 @@ class AsyncFineWebBatcher:
                 return
 
             ids = ids[need:]
+            labels = labels[need:]
             self.skipped_tokens = self.skip_tokens
 
         self.token_buffer.extend(ids)
+        self.label_buffer.extend(labels) # <--- Добавляем таргеты
 
     def _refill_locked(self, min_tokens):
         self._ensure_dataset_iter_locked()
@@ -163,14 +164,42 @@ class AsyncFineWebBatcher:
 
                 self.total_docs_seen += 1
 
-                text = sample.get("text", None)
+                sys_prompt = sample.get("system_prompt", "")
+                question = sample.get("question", "")
+                response = sample.get("response", "")
 
-                if isinstance(text, str) and len(text) > 50:
-                    texts.append(text)
+                if not question or not response:
+                    continue
+
+                # Формируем промпт (то, что модель не должна учиться предсказывать)
+                prompt_text = ""
+                if sys_prompt:
+                    prompt_text += f"Системное сообщение: {sys_prompt}\n\n"
+                prompt_text += f"Вопрос: {question}\n\nОтвет: "
+
+                # Полный текст диалога
+                full_text = prompt_text + response + self.tokenizer.eos_token
+
+                # Токенизируем
+                encoded_full = self.tokenizer(full_text, add_special_tokens=False, truncation=True, max_length=self.max_doc_tokens)
+                full_ids = encoded_full["input_ids"]
+                
+                prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+                prompt_len = len(prompt_ids)
+
+                # Создаем таргеты (копия полных ID)
+                label_ids = full_ids.copy()
+
+                # Заменяем всё до ответа ассистента на -100
+                for i in range(min(prompt_len, len(label_ids))):
+                    label_ids[i] = -100
+
+                self._append_or_skip_tokens_locked(full_ids, label_ids)
 
             if not texts:
                 continue
 
+            # Токенизируем пачку собранных диалогов
             encoded = self.tokenizer(
                 texts,
                 add_special_tokens=False,
@@ -186,18 +215,21 @@ class AsyncFineWebBatcher:
 
         self._refill_locked(tokens_per_batch * 8)
 
-        chunk = self.token_buffer[self.cursor:self.cursor + tokens_per_batch]
+        chunk_tokens = self.token_buffer[self.cursor:self.cursor + tokens_per_batch]
+        chunk_labels = self.label_buffer[self.cursor:self.cursor + tokens_per_batch]
 
-        if len(chunk) != tokens_per_batch:
+        if len(chunk_tokens) != tokens_per_batch:
             return None
 
         self.cursor += tokens_per_batch
         self._compact_if_needed_locked()
 
-        data_cpu = torch.tensor(
-            chunk,
-            dtype=torch.long,
-        ).view(self.micro_batch_size, self.block_size + 1)
+        # Делаем два тензора: один для текста, другой для таргетов
+        tokens_cpu = torch.tensor(chunk_tokens, dtype=torch.long).view(self.micro_batch_size, self.block_size + 1)
+        labels_cpu = torch.tensor(chunk_labels, dtype=torch.long).view(self.micro_batch_size, self.block_size + 1)
+        
+        # Склеиваем их в один объект, чтобы было удобно класть в очередь
+        data_cpu = torch.stack([tokens_cpu, labels_cpu], dim=0)
 
         if self.device.type == "cuda":
             data_cpu = data_cpu.pin_memory()
@@ -250,9 +282,14 @@ class AsyncFineWebBatcher:
         self.total_batches_consumed += 1
 
         data = data_cpu.to(self.device, non_blocking=True)
+        
+        tokens = data[0]
+        labels = data[1]
 
-        x = data[:, :-1].contiguous()
-        y = data[:, 1:].contiguous()
+        # x - это токены, сдвинутые влево
+        x = tokens[:, :-1].contiguous()
+        # y - это таргеты (где уже зашиты -100), сдвинутые вправо
+        y = labels[:, 1:].contiguous()
 
         return x, y
 
